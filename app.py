@@ -268,6 +268,22 @@ def read_box_region(page, clip):
                 if best is None or area > best[4]:
                     best = (minx, miny, maxx, maxy, area)
     if best is None:
+        # FIX: a ticked box's mark often touches/overlaps the box outline, merging
+        # them into one irregular blob that no longer passes the "roughly square,
+        # mostly hollow" filter above — so the filter was systematically rejecting
+        # real ticks while reliably finding empty boxes (which stay cleanly square).
+        # Confirmed against real data: every rejected box had substantial, clearly
+        # real ink (darkest_pixel ~3, i.e. near-black) in a small but non-square
+        # blob — exactly the signature of a tick merged with its outline, not an
+        # empty region (which has no meaningful ink at all). Treat that pattern as
+        # a tick rather than "undetected".
+        if near_miss is not None:
+            area, bw_pt, bh_pt, aspect, fill = near_miss
+            if 0.8 <= bw_pt <= 20 and 2 <= bh_pt <= 20 and fill >= 0.3:
+                return 1.0, {
+                    "reason": "inferred ticked from a non-box-shaped ink blob (a tick mark merged with or replacing the box outline)",
+                    "blob_w_pt": bw_pt, "blob_h_pt": bh_pt, "blob_fill": fill,
+                }
         diag = {"reason": "no box-shaped blob", "darkest_pixel": darkest, "clip_pt": [round(clip.width, 1), round(clip.height, 1)]}
         if near_miss:
             diag["largest_blob_w_pt"], diag["largest_blob_h_pt"], diag["largest_blob_aspect"], diag["largest_blob_fill"] = near_miss[1:]
@@ -437,7 +453,10 @@ def process(data: bytes, debug: bool = False):
             else:
                 lb["ratio"], diag = read_box(page, lb)
                 lb["source"] = "pixels" if lb["ratio"] is not None else None
-                lb["fail_diag"] = diag if lb["ratio"] is None else None
+                # Keep the diagnostic even on success — it's how the fallback
+                # path (a tick merged with its outline) stays visible rather
+                # than looking identical to a normal clean detection.
+                lb["fail_diag"] = diag
         per_page.append((pi, page, words, labels))
 
     ratios = [lb["ratio"] for _, _, _, labels in per_page for lb in labels if lb["ratio"] is not None]
