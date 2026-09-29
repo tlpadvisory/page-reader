@@ -29,7 +29,10 @@ from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="page-reader")
 
-API_KEY = os.environ.get("PAGE_READER_KEY", "")
+# .strip() guards against a stray trailing newline or space that can end up in
+# the stored value when a password is copied out of a terminal (terminal output
+# always ends with a line break) and pasted into a platform's variable field.
+API_KEY = os.environ.get("PAGE_READER_KEY", "").strip()
 
 ZOOM = 300 / 72.0          # render tiny clips at 300 dpi so thin box outlines survive
 INK = 200                  # grey level (0=black, 255=white) below which a pixel counts as ink
@@ -426,7 +429,13 @@ def health():
 
 @app.post("/form2-ticks")
 async def form2_ticks(request: Request, x_api_key: str = Header(default=""), debug: int = 0):
-    if not API_KEY or not hmac.compare_digest(x_api_key, API_KEY):
+    provided = (x_api_key or "").strip()
+    if not API_KEY or not hmac.compare_digest(provided, API_KEY):
+        # Visible in Railway -> Deployments -> (click the deployment) -> logs.
+        # Lengths differing after stripping whitespace means the two values are
+        # genuinely different, not just a formatting mismatch.
+        print(f"[AUTH] rejected — provided_len={len(provided)} expected_len={len(API_KEY)} "
+              f"provided_prefix={provided[:6]!r} expected_prefix={API_KEY[:6]!r}", flush=True)
         raise HTTPException(status_code=401, detail="unauthorized")
     data = await request.body()
     if not data:
