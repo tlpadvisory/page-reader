@@ -335,6 +335,13 @@ def statement_for(group, words, lines, label_pos):
     cands = [w for w in words
              if abs((w[1] + w[3]) / 2 - yc) <= 4 and w[2] <= lx - 6
              and w[4] not in LABELS
+             # FIX: a stray checkmark/tick character elsewhere on the row (real
+             # observed case: an isolated "✔" word) was sometimes the nearest
+             # thing to the left of the label and got mistaken for the actual
+             # descriptive text, producing a statement of just "✔". A genuine
+             # checkbox glyph is never the statement itself — skip any
+             # candidate that's just a single non-alphanumeric character.
+             and not (len(w[4]) == 1 and not w[4].isalnum())
              and (round(w[0], 1), round(w[1], 1)) not in label_pos]
     if not cands:
         return ""
