@@ -41,7 +41,13 @@ GLYPH_CHECKED = set("\u2611\u2612\u2713\u2714")   # ☑ ☒ ✓ ✔
 GLYPH_EMPTY = set("\u2610\u25a1\u25a2")            # ☐ □ ▢
 STOP_FIRST_WORDS = {"if", "or", "note", "note\u2014", "note-"}
 # a glyph box and its label can come out of the text layer as one fused word, e.g. "\u2610Yes"
-FUSED_LABEL = re.compile("^([\u2610\u2611\u2612\u25a1\u25a2\u2713\u2714])\\s*(Yes|No)$")
+# Was limited to a handful of known Unicode checkbox glyphs; DocuSign and other
+# PDF generators often use their own custom glyph in a private-use codepoint
+# instead, which this narrow match would silently skip. Now matches ANY single
+# non-letter character fused directly to "Yes"/"No" — if it happens to be one of
+# the known checked/unchecked symbols its state is read from the character itself;
+# otherwise its own precise pixel box (via glyph_char_box) is read like a drawn box.
+FUSED_LABEL = re.compile(r"^([^\sA-Za-z0-9])\s*(Yes|No)$")
 
 
 # --------------------------------------------------------------------------
@@ -63,7 +69,37 @@ def find_form2_pages(doc):
 # --------------------------------------------------------------------------
 # Finding the printed Yes / No labels
 # --------------------------------------------------------------------------
-def find_labels(words):
+def get_char_boxes(page):
+    """Every character on the page with its own precise box, via the raw text
+    dict (PyMuPDF's word-level extraction only gives whole-word boxes, which
+    isn't precise enough to isolate a single glyph fused to "Yes"/"No")."""
+    chars = []
+    d = page.get_text("rawdict")
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for ch in span.get("chars", []):
+                    x0, y0, x1, y1 = ch["bbox"]
+                    chars.append((x0, y0, x1, y1, ch["c"]))
+    return chars
+
+
+def glyph_char_box(word, char_boxes):
+    """Within a fused word like '\uf0a8No', find the leading non-letter
+    character's own precise box (the actual checkbox glyph), rather than
+    estimating its position from the whole word's box."""
+    wx0, wy0, wx1, wy1 = word[0], word[1], word[2], word[3]
+    for (cx0, cy0, cx1, cy1, ch) in char_boxes:
+        if ch.isalnum():
+            continue
+        cyc = (cy0 + cy1) / 2
+        wyc = (wy0 + wy1) / 2
+        if abs(cyc - wyc) <= 2 and wx0 - 1 <= cx0 <= wx1 + 1 and cx1 <= wx1 + 1:
+            return (cx0, cy0, cx1, cy1)
+    return None
+
+
+def find_labels(words, char_boxes=None):
     """
     A tick-box label is a standalone word 'Yes' or 'No' with a gap on its left
     (where the box sits) and nothing running on after it. A 'Yes'/'No' inside
@@ -106,8 +142,19 @@ def find_labels(words):
             continue  # running text such as "No further information"
         glyph_state = None
         box_word = None
+        precise_box = None
         if fused_glyph is not None:
-            glyph_state = fused_glyph in GLYPH_CHECKED
+            if fused_glyph in GLYPH_CHECKED:
+                glyph_state = True
+            elif fused_glyph in GLYPH_EMPTY:
+                glyph_state = False
+            else:
+                # An unrecognised glyph fused to the label — likely a custom
+                # checkbox font (e.g. DocuSign's own). Locate its own precise
+                # box instead of guessing; read it by pixels like a drawn box.
+                precise_box = glyph_char_box(w, char_boxes) if char_boxes else None
+                if precise_box is None:
+                    continue  # can't safely isolate this glyph — skip rather than guess
         elif prev is not None:
             ptext = prev[4]
             gap = x0 - prev[2]
@@ -133,6 +180,7 @@ def find_labels(words):
             "glyph": glyph_state,
             "left_text_x1": left_text_x1,
             "box_word_pos": (round(box_word[0], 1), round(box_word[1], 1)) if box_word else None,
+            "precise_box": precise_box,
         })
     return labels
 
@@ -141,6 +189,15 @@ def find_labels(words):
 # Reading the box next to a label
 # --------------------------------------------------------------------------
 def read_box(page, label):
+    """Returns (ratio, diag) — ratio is None on failure, with diag explaining why."""
+    if label.get("precise_box") is not None:
+        x0, y0, x1, y1 = label["precise_box"]
+        pad = 0.5
+        return read_box_region(page, pymupdf.Rect(x0 - pad, y0 - pad, x1 + pad, y1 + pad) & page.rect)
+    return read_box_from_label_gap(page, label)
+
+
+def read_box_from_label_gap(page, label):
     """
     Renders a small clip just left of the label, finds the square outline, and
     returns how much ink sits inside it (a tick mark => high, empty box => ~0).
@@ -154,15 +211,29 @@ def read_box(page, label):
         left = max(left, label["left_text_x1"] + 0.5)
     clip = pymupdf.Rect(left, label["y0"] - 3, label["x0"] - 0.5, label["y1"] + 3) & page.rect
     if clip.is_empty or clip.width < 4:
-        return None
+        return None, {"reason": "search window too narrow", "left_text_x1": label.get("left_text_x1")}
+    return read_box_region(page, clip)
+
+
+def read_box_region(page, clip):
+    """Given a clip rect that should contain exactly one checkbox, finds the
+    box-shaped outline in it and returns (ratio, diag). ratio is None if no
+    box-shaped outline is found — diag then explains why: whether there was
+    any ink in the clip at all (nothing there vs. wrong shape/size), and the
+    closest-shaped blob considered, so a failure can be told apart from a
+    genuinely empty region instead of just returning nothing."""
+    if clip.is_empty or clip.width < 3 or clip.height < 3:
+        return None, {"reason": "clip too small", "clip_pt": [round(clip.width, 1), round(clip.height, 1)]}
     pix = page.get_pixmap(matrix=pymupdf.Matrix(ZOOM, ZOOM), clip=clip,
                           colorspace=pymupdf.csGRAY, alpha=False)
     w, h, stride = pix.width, pix.height, pix.stride
     data = pix.samples
     dark = [[data[y * stride + x] < INK for x in range(w)] for y in range(h)]
+    darkest = min((data[y * stride + x] for y in range(h) for x in range(w)), default=255)
 
     seen = [[False] * w for _ in range(h)]
     best = None
+    near_miss = None  # largest blob even if it failed the shape/size filter
     for sy in range(h):
         for sx in range(w):
             if not dark[sy][sx] or seen[sy][sx]:
@@ -189,22 +260,27 @@ def read_box(page, label):
             bw_pt, bh_pt = bw / ZOOM, bh / ZOOM
             aspect = bw / bh if bh else 0
             fill = n / (bw * bh)
+            area = bw * bh
+            if near_miss is None or area > near_miss[0]:
+                near_miss = (area, round(bw_pt, 1), round(bh_pt, 1), round(aspect, 2), round(fill, 2))
             # a checkbox: roughly square, 5-15pt, mostly hollow
             if 5 <= bw_pt <= 15 and 5 <= bh_pt <= 15 and 0.75 <= aspect <= 1.33 and fill < 0.7:
-                area = bw * bh
                 if best is None or area > best[4]:
                     best = (minx, miny, maxx, maxy, area)
     if best is None:
-        return None
+        diag = {"reason": "no box-shaped blob", "darkest_pixel": darkest, "clip_pt": [round(clip.width, 1), round(clip.height, 1)]}
+        if near_miss:
+            diag["largest_blob_w_pt"], diag["largest_blob_h_pt"], diag["largest_blob_aspect"], diag["largest_blob_fill"] = near_miss[1:]
+        return None, diag
     minx, miny, maxx, maxy, _ = best
     bw, bh = maxx - minx + 1, maxy - miny + 1
     inset = max(2, round(0.22 * min(bw, bh)))
     ix0, iy0, ix1, iy1 = minx + inset, miny + inset, maxx - inset, maxy - inset
     if ix1 <= ix0 or iy1 <= iy0:
-        return None
+        return None, {"reason": "box found but too small to sample interior"}
     total = (ix1 - ix0 + 1) * (iy1 - iy0 + 1)
     ink = sum(1 for y in range(iy0, iy1 + 1) for x in range(ix0, ix1 + 1) if dark[y][x])
-    return ink / total
+    return ink / total, None
 
 
 def choose_threshold(ratios):
@@ -335,18 +411,33 @@ def process(data: bytes, debug: bool = False):
 
     form2 = find_form2_pages(doc)
     per_page = []
+    no_label_pages = []
     for pi in form2:
         page = doc[pi]
         if page.rotation:
             page.set_rotation(0)
         words = page.get_text("words")
-        labels = find_labels(words)
+        char_boxes = get_char_boxes(page)
+        labels = find_labels(words, char_boxes)
+        if debug and not labels:
+            # A form2 page with zero Yes/No labels means the matcher found
+            # nothing at all on it — dump what's actually there so the cause
+            # (different wording, unusual spacing, a glyph this build still
+            # doesn't recognise) is visible directly instead of guessed again.
+            no_label_pages.append({
+                "page": pi + 1,
+                "word_count": len(words),
+                "sample_words": [w[4] for w in words[:80]],
+                "char_count": len(char_boxes),
+                "non_alnum_chars": sorted({c[4] for c in char_boxes if not c[4].isalnum() and not c[4].isspace()}),
+            })
         for lb in labels:
             if lb["glyph"] is not None:
-                lb["ratio"], lb["source"] = None, "glyph"
+                lb["ratio"], lb["source"], lb["fail_diag"] = None, "glyph", None
             else:
-                lb["ratio"] = read_box(page, lb)
+                lb["ratio"], diag = read_box(page, lb)
                 lb["source"] = "pixels" if lb["ratio"] is not None else None
+                lb["fail_diag"] = diag if lb["ratio"] is None else None
         per_page.append((pi, page, words, labels))
 
     ratios = [lb["ratio"] for _, _, _, labels in per_page for lb in labels if lb["ratio"] is not None]
@@ -367,7 +458,7 @@ def process(data: bytes, debug: bool = False):
             if debug:
                 debug_labels.append({"page": pi + 1, "text": lb["text"], "yc": round(lb["yc"], 1),
                                      "x0": round(lb["x0"], 1), "ratio": lb["ratio"], "state": lb["state"],
-                                     "source": lb["source"]})
+                                     "source": lb["source"], "fail_diag": lb.get("fail_diag")})
 
         label_pos = {(round(l["x0"], 1), round(l["y0"], 1)) for l in labels}
         label_pos |= {l["box_word_pos"] for l in labels if l["box_word_pos"]}
@@ -415,6 +506,8 @@ def process(data: bytes, debug: bool = False):
     }
     if debug:
         result["labels"] = debug_labels
+        if no_label_pages:
+            result["pages_with_no_labels_found"] = no_label_pages
     doc.close()
     return result
 
