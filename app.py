@@ -429,113 +429,115 @@ def widget_stats(doc, page_indexes):
 def process(data: bytes, debug: bool = False):
     t0 = time.time()
     doc = pymupdf.open(stream=data, filetype="pdf")
-    if doc.needs_pass:
-        raise ValueError("PDF is password protected")
+    try:
+        if doc.needs_pass:
+            raise ValueError("PDF is password protected")
 
-    form2 = find_form2_pages(doc)
-    per_page = []
-    no_label_pages = []
-    for pi in form2:
-        page = doc[pi]
-        if page.rotation:
-            page.set_rotation(0)
-        words = page.get_text("words")
-        char_boxes = get_char_boxes(page)
-        labels = find_labels(words, char_boxes)
-        if debug and not labels:
-            # A form2 page with zero Yes/No labels means the matcher found
-            # nothing at all on it — dump what's actually there so the cause
-            # (different wording, unusual spacing, a glyph this build still
-            # doesn't recognise) is visible directly instead of guessed again.
-            no_label_pages.append({
-                "page": pi + 1,
-                "word_count": len(words),
-                "sample_words": [w[4] for w in words[:80]],
-                "char_count": len(char_boxes),
-                "non_alnum_chars": sorted({c[4] for c in char_boxes if not c[4].isalnum() and not c[4].isspace()}),
-            })
-        for lb in labels:
-            if lb["glyph"] is not None:
-                lb["ratio"], lb["source"], lb["fail_diag"] = None, "glyph", None
-            else:
-                lb["ratio"], diag = read_box(page, lb)
-                lb["source"] = "pixels" if lb["ratio"] is not None else None
-                # Keep the diagnostic even on success — it's how the fallback
-                # path (a tick merged with its outline) stays visible rather
-                # than looking identical to a normal clean detection.
-                lb["fail_diag"] = diag
-        per_page.append((pi, page, words, labels))
+        form2 = find_form2_pages(doc)
+        per_page = []
+        no_label_pages = []
+        for pi in form2:
+            page = doc[pi]
+            if page.rotation:
+                page.set_rotation(0)
+            words = page.get_text("words")
+            char_boxes = get_char_boxes(page)
+            labels = find_labels(words, char_boxes)
+            if debug and not labels:
+                # A form2 page with zero Yes/No labels means the matcher found
+                # nothing at all on it — dump what's actually there so the cause
+                # (different wording, unusual spacing, a glyph this build still
+                # doesn't recognise) is visible directly instead of guessed again.
+                no_label_pages.append({
+                    "page": pi + 1,
+                    "word_count": len(words),
+                    "sample_words": [w[4] for w in words[:80]],
+                    "char_count": len(char_boxes),
+                    "non_alnum_chars": sorted({c[4] for c in char_boxes if not c[4].isalnum() and not c[4].isspace()}),
+                })
+            for lb in labels:
+                if lb["glyph"] is not None:
+                    lb["ratio"], lb["source"], lb["fail_diag"] = None, "glyph", None
+                else:
+                    lb["ratio"], diag = read_box(page, lb)
+                    lb["source"] = "pixels" if lb["ratio"] is not None else None
+                    # Keep the diagnostic even on success — it's how the fallback
+                    # path (a tick merged with its outline) stays visible rather
+                    # than looking identical to a normal clean detection.
+                    lb["fail_diag"] = diag
+            per_page.append((pi, page, words, labels))
 
-    ratios = [lb["ratio"] for _, _, _, labels in per_page for lb in labels if lb["ratio"] is not None]
-    threshold = choose_threshold(ratios)
+        ratios = [lb["ratio"] for _, _, _, labels in per_page for lb in labels if lb["ratio"] is not None]
+        threshold = choose_threshold(ratios)
 
-    items = []
-    unreadable_boxes = 0
-    debug_labels = []
-    for pi, page, words, labels in per_page:
-        for lb in labels:
-            if lb["glyph"] is not None:
-                lb["state"] = lb["glyph"]
-            elif lb["ratio"] is not None:
-                lb["state"] = lb["ratio"] >= threshold
-            else:
-                lb["state"] = None
-                unreadable_boxes += 1
-            if debug:
-                debug_labels.append({"page": pi + 1, "text": lb["text"], "yc": round(lb["yc"], 1),
-                                     "x0": round(lb["x0"], 1), "ratio": lb["ratio"], "state": lb["state"],
-                                     "source": lb["source"], "fail_diag": lb.get("fail_diag")})
+        items = []
+        unreadable_boxes = 0
+        debug_labels = []
+        for pi, page, words, labels in per_page:
+            for lb in labels:
+                if lb["glyph"] is not None:
+                    lb["state"] = lb["glyph"]
+                elif lb["ratio"] is not None:
+                    lb["state"] = lb["ratio"] >= threshold
+                else:
+                    lb["state"] = None
+                    unreadable_boxes += 1
+                if debug:
+                    debug_labels.append({"page": pi + 1, "text": lb["text"], "yc": round(lb["yc"], 1),
+                                         "x0": round(lb["x0"], 1), "ratio": lb["ratio"], "state": lb["state"],
+                                         "source": lb["source"], "fail_diag": lb.get("fail_diag")})
 
-        label_pos = {(round(l["x0"], 1), round(l["y0"], 1)) for l in labels}
-        label_pos |= {l["box_word_pos"] for l in labels if l["box_word_pos"]}
-        lines = build_lines(words)
-        rows = []
-        for lb in sorted(labels, key=lambda l: (l["yc"], l["x0"])):
-            if rows and abs(lb["yc"] - rows[-1][0]["yc"]) <= 4:
-                rows[-1].append(lb)
-            else:
-                rows.append([lb])
-        for group in rows:
-            yes_l = [l for l in group if l["text"] == "Yes"]
-            no_l = [l for l in group if l["text"] == "No"]
-            ambiguous = len(yes_l) > 1 or len(no_l) > 1
-            yes = yes_l[0]["state"] if len(yes_l) == 1 else None
-            no = no_l[0]["state"] if len(no_l) == 1 else None
-            if (yes_l and yes is None) or (no_l and no is None):
-                ambiguous = True   # a box we could not read
-            if yes is True and no is True:
-                ambiguous = True   # both ticked: cannot trust either
-            items.append({
-                "page": pi + 1,
-                "y": round(group[0]["yc"], 1),
-                "statement": statement_for(group, words, lines, label_pos),
-                "yes": yes,
-                "no": no,
-                "ambiguous": ambiguous,
-            })
+            label_pos = {(round(l["x0"], 1), round(l["y0"], 1)) for l in labels}
+            label_pos |= {l["box_word_pos"] for l in labels if l["box_word_pos"]}
+            lines = build_lines(words)
+            rows = []
+            for lb in sorted(labels, key=lambda l: (l["yc"], l["x0"])):
+                if rows and abs(lb["yc"] - rows[-1][0]["yc"]) <= 4:
+                    rows[-1].append(lb)
+                else:
+                    rows.append([lb])
+            for group in rows:
+                yes_l = [l for l in group if l["text"] == "Yes"]
+                no_l = [l for l in group if l["text"] == "No"]
+                ambiguous = len(yes_l) > 1 or len(no_l) > 1
+                yes = yes_l[0]["state"] if len(yes_l) == 1 else None
+                no = no_l[0]["state"] if len(no_l) == 1 else None
+                if (yes_l and yes is None) or (no_l and no is None):
+                    ambiguous = True   # a box we could not read
+                if yes is True and no is True:
+                    ambiguous = True   # both ticked: cannot trust either
+                items.append({
+                    "page": pi + 1,
+                    "y": round(group[0]["yc"], 1),
+                    "statement": statement_for(group, words, lines, label_pos),
+                    "yes": yes,
+                    "no": no,
+                    "ambiguous": ambiguous,
+                })
 
-    w_total, w_checked = widget_stats(doc, form2)
-    result = {
-        "ok": True,
-        "items": items,
-        "diagnostics": {
-            "pdf_pages": len(doc),
-            "form2_pages": [p + 1 for p in form2],
-            "labels_found": sum(len(labels) for _, _, _, labels in per_page),
-            "boxes_unreadable": unreadable_boxes,
-            "threshold": round(threshold, 3),
-            "ratios_sorted": [round(r, 3) for r in sorted(ratios)],
-            "checkbox_widgets": w_total,
-            "checkbox_widgets_checked": w_checked,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        },
-    }
-    if debug:
-        result["labels"] = debug_labels
-        if no_label_pages:
-            result["pages_with_no_labels_found"] = no_label_pages
-    doc.close()
-    return result
+        w_total, w_checked = widget_stats(doc, form2)
+        result = {
+            "ok": True,
+            "items": items,
+            "diagnostics": {
+                "pdf_pages": len(doc),
+                "form2_pages": [p + 1 for p in form2],
+                "labels_found": sum(len(labels) for _, _, _, labels in per_page),
+                "boxes_unreadable": unreadable_boxes,
+                "threshold": round(threshold, 3),
+                "ratios_sorted": [round(r, 3) for r in sorted(ratios)],
+                "checkbox_widgets": w_total,
+                "checkbox_widgets_checked": w_checked,
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            },
+        }
+        if debug:
+            result["labels"] = debug_labels
+            if no_label_pages:
+                result["pages_with_no_labels_found"] = no_label_pages
+        return result
+    finally:
+        doc.close()
 
 
 # --------------------------------------------------------------------------
@@ -548,6 +550,15 @@ def health():
 
 @app.post("/form2-ticks")
 async def form2_ticks(request: Request, x_api_key: str = Header(default=""), debug: int = 0):
+    # FIX (diagnostics): a request once took ~2 minutes and ended in a client
+    # timeout, but nothing at all showed up in these logs for it — meaning it's
+    # impossible to tell whether it never reached this handler, stalled while
+    # the (up to ~25MB) request body was still arriving over the network, or
+    # stalled during actual PDF processing. These three phases are now timed
+    # and logged separately so a repeat makes the real cause obvious.
+    t_start = time.time()
+    print(f"[REQ] received, debug={debug}", flush=True)
+
     provided = (x_api_key or "").strip()
     if not API_KEY or not hmac.compare_digest(provided, API_KEY):
         # Visible in Railway -> Deployments -> (click the deployment) -> logs.
@@ -556,12 +567,21 @@ async def form2_ticks(request: Request, x_api_key: str = Header(default=""), deb
         print(f"[AUTH] rejected — provided_len={len(provided)} expected_len={len(API_KEY)} "
               f"provided_prefix={provided[:6]!r} expected_prefix={API_KEY[:6]!r}", flush=True)
         raise HTTPException(status_code=401, detail="unauthorized")
+
     data = await request.body()
+    t_body = time.time()
+    print(f"[REQ] body received: {len(data)} bytes in {t_body - t_start:.1f}s", flush=True)
     if not data:
         raise HTTPException(status_code=400, detail="empty body")
+
     try:
-        return await run_in_threadpool(process, data, bool(debug))
+        result = await run_in_threadpool(process, data, bool(debug))
+        t_done = time.time()
+        print(f"[REQ] processing complete in {t_done - t_body:.1f}s (total {t_done - t_start:.1f}s)", flush=True)
+        return result
     except ValueError as e:
+        print(f"[REQ] failed after {time.time() - t_body:.1f}s processing: {e}", flush=True)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:  # unreadable / corrupt PDF etc.
+        print(f"[REQ] failed after {time.time() - t_body:.1f}s processing: {e}", flush=True)
         raise HTTPException(status_code=422, detail=f"could not process PDF: {e}")
