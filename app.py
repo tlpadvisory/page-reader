@@ -426,6 +426,38 @@ def widget_stats(doc, page_indexes):
     return total, checked
 
 
+# --------------------------------------------------------------------------
+# Finding the Form 33 (Body Corporate Certificate) pages
+# --------------------------------------------------------------------------
+def find_form33_text(doc, max_pages=6):
+    """Text of the Form 33 pages, located deterministically (no search/AI).
+
+    A genuine BCCM Form 33 literally says "Form 33" and "Body Corporate
+    Certificate". Start at the first page that does, and take that page plus the
+    following ones (the contribution tables sit a page or two in). Pages are
+    plain extracted text; image-only pages come back empty.
+    """
+    start = None
+    for i in range(len(doc)):
+        try:
+            text = doc[i].get_text("text")
+        except Exception:
+            continue
+        if re.search(r"\bform\s*33\b", text, re.I) and re.search(r"body\s+corporate\s+certificate|certificate", text, re.I):
+            start = i
+            break
+    if start is None:
+        return {"found": False, "pages": []}
+    pages = []
+    for i in range(start, min(start + max_pages, len(doc))):
+        try:
+            text = doc[i].get_text("text")
+        except Exception:
+            text = ""
+        pages.append({"page": i + 1, "text": text})
+    return {"found": True, "start_page": start + 1, "pages": pages}
+
+
 def process(data: bytes, debug: bool = False):
     t0 = time.time()
     doc = pymupdf.open(stream=data, filetype="pdf")
@@ -531,6 +563,10 @@ def process(data: bytes, debug: bool = False):
                 "elapsed_ms": int((time.time() - t0) * 1000),
             },
         }
+        try:
+            result["form33"] = find_form33_text(doc)
+        except Exception as e:  # never let this break the tick reading
+            result["form33"] = {"found": False, "pages": [], "error": str(e)}
         if debug:
             result["labels"] = debug_labels
             if no_label_pages:
