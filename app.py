@@ -621,3 +621,51 @@ async def form2_ticks(request: Request, x_api_key: str = Header(default=""), deb
     except Exception as e:  # unreadable / corrupt PDF etc.
         print(f"[REQ] failed after {time.time() - t_body:.1f}s processing: {e}", flush=True)
         raise HTTPException(status_code=422, detail=f"could not process PDF: {e}")
+# --------------------------------------------------------------------------
+# NEW: plain text of the first few pages — used by inbound-documents to find the
+# property address printed on an attached contract / disclosure statement.
+# No AI and no page rendering, so it is fast. Paste this block at the very END of app.py.
+#
+#   POST /first-pages-text   body = raw PDF bytes, header x-api-key: <PAGE_READER_KEY>
+#                            optional query ?pages=3 (1-5)
+#   -> {"ok": true, "pdf_pages": 24, "pages": [{"page": 1, "text": "..."}, ...]}
+# --------------------------------------------------------------------------
+def first_pages_text(data: bytes, n_pages: int = 3):
+    doc = pymupdf.open(stream=data, filetype="pdf")
+    try:
+        if doc.needs_pass:
+            raise ValueError("PDF is password protected")
+        pages = []
+        for i in range(min(n_pages, len(doc))):
+            try:
+                text = doc[i].get_text("text")
+            except Exception:
+                text = ""
+            pages.append({"page": i + 1, "text": re.sub(r"[ \t]+", " ", text).strip()[:3000]})
+        return {"ok": True, "pdf_pages": len(doc), "pages": pages}
+    finally:
+        doc.close()
+
+
+@app.post("/first-pages-text")
+async def first_pages_text_endpoint(request: Request, x_api_key: str = Header(default=""), pages: int = 3):
+    provided = (x_api_key or "").strip()
+    if not API_KEY or not hmac.compare_digest(provided, API_KEY):
+        print(f"[AUTH] first-pages-text rejected — provided_len={len(provided)} expected_len={len(API_KEY)}", flush=True)
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty body")
+
+    n = max(1, min(int(pages), 5))
+    t0 = time.time()
+    try:
+        result = await run_in_threadpool(first_pages_text, data, n)
+        print(f"[REQ] first-pages-text {len(data)} bytes, {n} page(s) in {time.time() - t0:.1f}s", flush=True)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[REQ] first-pages-text failed: {e}", flush=True)
+        raise HTTPException(status_code=422, detail=f"could not process PDF: {e}")
